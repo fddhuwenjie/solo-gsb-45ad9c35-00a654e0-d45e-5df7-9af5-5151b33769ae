@@ -8,6 +8,7 @@
 - 按孔查询当前体积、各初始样本占比，以及涉及该孔的完整批次记录；
 - **误操作批次撤销**：成功提交的批次在同一事务保存其首次触及各孔的批前快照，可原子恢复；仅当批次已提交、尚未撤销且之后没有补液或后续批次触及这些孔时允许撤销，原批次保留并追加审计记录；
 - **孔位异常隔离**：操作员提交一组已登记孔、案件号与原因，服务在同一事务确认这些孔尚未隔离后原子建立隔离记录（任一孔已被隔离即整次拒绝，不留部分状态）；隔离中的孔禁止补液、作为批次来源/目标、修改容量或撤销触及它的批次；解除隔离须携带对应案件号，批量解除任一不匹配即整体拒绝；申请与解除审计永久保留，孔位及相关批次查询返回当前隔离信息；
+- **移液体积预留**：操作员用 `request_key` 为未来批次一次预留多个**已登记来源孔**的 `Decimal` 体积，服务在同一事务逐孔按「当前体积 − 其他生效预留」检查可用量——任一孔不足、孔已隔离或同一孔在请求内重复，即整次失败、不留部分预留、不消耗 `request_key`；同键同目标（逐孔逐量）重放返回首次结果，同键换目标 `409`。生效预留占用的体积，**普通补液不会释放、未绑定预留的批次不能动用**（未绑定批次每步可用量 = 当前体积 − 全部生效预留）；提交批次可携带 `reservation_id`，只有对各来源孔的吸取总量**逐孔逐量完全兑现**预留时才在同一事务执行并把预留标记为 `consumed`，任何不符整批拒绝、不落失败批次、不消耗预留。未消费预留可用**独立的 `request_key`** 整体取消（`cancelled`，占用立即释放），已消费预留不可取消；取消/兑现与隔离申请经同一把写锁串行——孔上有生效预留时隔离申请被拒绝并在 `blocking_wells` 中逐孔列出阻塞预留；
 - 所有体积运算使用 `Decimal`（统一量化到小数点后 9 位），不使用 float；
 - 通过 `request_key` 幂等去重：相同键重复提交不会重复执行，直接返回首个结果（失败批次同样被记录并消耗该键）；批次撤销同样以 `request_key` 幂等：同键同目标返回首次结果，同键换目标返回 `409`。
 
@@ -52,6 +53,9 @@ pytest                                       # 运行测试
 | `POST` | `/quarantines` | 孔位隔离申请：一组已登记孔 + 案件号 + 原因（`request_key` 幂等） |
 | `POST` | `/quarantines/releases` | 解除隔离：须携带对应 `case_id`，批量解除任一不匹配整体拒绝（`request_key` 幂等） |
 | `GET` | `/quarantines` / `/quarantines/releases` | 全部隔离申请（含各孔状态）/ 解除审计记录 |
+| `POST` | `/reservations` | 为未来批次一次预留多个已登记来源孔的 Decimal 体积（`request_key` 幂等） |
+| `GET` | `/reservations` / `/reservations/{id}` | 全部 / 单个预留：逐孔明细与状态（`reserved` / `consumed` / `cancelled`） |
+| `POST` | `/reservations/{id}/cancellations` | 用独立 `request_key` 整体取消未消费预留（已消费不可取消） |
 
 孔位标签为「字母 + 数字」（如 `A1`、`B12`），不区分大小写；本服务按单块板建模。
 
@@ -213,13 +217,101 @@ curl -s http://localhost:8000/quarantines           # 申请记录保留，各�
 curl -s http://localhost:8000/quarantines/releases  # 解除审计记录
 ```
 
+### 移液体积预留与兑现
+
+```bash
+# 20. 为未来批次一次预留多个已登记来源孔的体积（同一事务逐孔检查可用量）
+curl -s -X POST http://localhost:8000/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "request_key": "rsv-2026-10-02-001",
+        "wells": [
+          {"well": "A1", "volume": "40"},
+          {"well": "A2", "volume": "30"}
+        ]
+      }'
+# => 201 {"reservation_id":1,"request_key":"rsv-2026-10-02-001",
+#         "status":"reserved","batch_id":null,"consumed_at":null,
+#         "wells":[{"well":"A1","volume":"40"},{"well":"A2","volume":"30"}],
+#         "cancellation":null}
+
+# 孔位查询新增 reserved_volume：被生效预留占用的体积（液体本身不变）
+curl -s http://localhost:8000/wells/A1
+# => {"well":"A1","volume":"100","reserved_volume":"40","max_capacity":null,
+#     "quarantine":null,"composition":[...]}
+
+# 21. 任一孔扣除其他生效预留后可用量不足 -> 409 reservation_insufficient，
+#     整次失败不留部分预留、不消耗 request_key（conflicting_wells 逐孔列出
+#     available / reserved / requested）
+curl -s -X POST http://localhost:8000/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key":"rsv-2026-10-02-002",
+       "wells":[{"well":"A1","volume":"61"},{"well":"A2","volume":"10"}]}'
+# => 409 {"detail":{"reason":"reservation_insufficient",
+#         "conflicting_wells":[{"well":"A1","available":"60",
+#                              "reserved":"40","requested":"61"}]}}
+# 同一请求里同一孔重复 -> 422；孔未登记 -> 404；孔已隔离 -> 409 well_quarantined
+
+# 22. 同键同目标（逐孔逐量，大小写归一）重放 -> 200 且 replayed=true；
+#     同键换孔或换量 -> 409 request_key_conflict（existing_wells 给出原目标）
+
+# 23. 未绑定预留的批次不能动用被预留体积：A1 可用只剩 60
+curl -s -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key":"run-2026-10-02-010",
+       "operations":[{"source":"A1","destination":"B1","volume":"61"}]}'
+# => 409 {"detail":{"well":"A1","available":"60","requested":"61",...}}
+# 普通补液不受预留阻碍（只受容量上限约束），补液新增的未预留部分可被普通批次使用
+
+# 24. 提交批次携带 reservation_id：逐孔逐量完全兑现才执行，
+#     同一事务把预留标记为 consumed
+curl -s -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key":"run-2026-10-02-011","reservation_id":1,
+       "operations":[
+         {"source":"A1","destination":"C1","volume":"40"},
+         {"source":"A2","destination":"C1","volume":"30"}
+       ]}'
+# => 201 {"batch_id":...,"reservation_id":1,...}
+curl -s http://localhost:8000/reservations/1
+# => {"status":"consumed","batch_id":<上面的批次>,"consumed_at":"...",...}
+# 绑定批次可动用自己预留的体积（仍扣除其他生效预留）；量不符（少孔、多取、
+# 同孔两步累计不等于预留量）-> 409 reservation_mismatch，wells 逐孔列出
+# reserved/requested；预留编号不存在 -> 404；已消费/已取消 -> 409
+# reservation_not_active。以上失败都不落失败批次、不消耗预留与 request_key
+
+# 25. 未消费预留用独立 request_key 整体取消；占用立即释放
+curl -s -X POST http://localhost:8000/reservations/2/cancellations \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key":"cancel-2026-10-02-001"}'
+# => 201 {"cancellation_id":1,"reservation_id":2,
+#         "reservation":{"status":"cancelled",...}}
+# 已消费预留不可取消 -> 409 reservation_not_active（status=consumed）；
+# 已取消预留用同一取消键重放 -> 200，换新键再取消 -> 409（status=cancelled）；
+# 取消键用于另一个预留 -> 409 request_key_conflict
+
+# 26. 隔离申请与预留的取消/兑现串行：孔上有生效预留时隔离被拒绝，
+#     blocking_wells 逐孔列出阻塞预留（编号、request_key、体积）
+curl -s -X POST http://localhost:8000/quarantines \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key":"quar-2026-10-02-001","case_id":"CASE-2026-201",
+       "reason":"复检","wells":["A1","A2"]}'
+# => 409 {"detail":{"reason":"active_reservations","blocking_wells":[
+#         {"well":"A1","reservations":[{"reservation_id":1,
+#            "request_key":"rsv-2026-10-02-001","volume":"40"}]}, ...]}}
+# 先取消预留（或由绑定批次兑现）后，同键隔离即可成功
+
+# 27. 查询预留明细与状态
+curl -s http://localhost:8000/reservations          # 全部（含已消费/已取消）
+```
+
 ## 设计要点
 
 - **Decimal 精度**：体积与组分量在库中以 TEXT 存 Decimal 字符串，运算全部走 `decimal.Decimal`，结果统一量化到 9 位小数（`ROUND_HALF_UP`），接口返回值中的数字均为字符串以避免 JSON 精度损失。
 - **按比例吸取（整数单位最大余量法）**：从孔中吸取体积 `v`（孔总量 `V`，均以 9 位小数的最小计量单位 QUANTUM 计）时，每个初始样本先分得比例份额 `amount × v/V` 的整数单位，剩余单位按小数余量从大到小分配；余量相同按样本 ID 升序。任何样本分得的单位数不超过其原有量，且各样本带走量之和恰好等于 `v`——保证每一步之后来源孔与目标孔都满足「组分量之和 = 体积」；目标孔将各组分量累加，即视为立即完美混合。
 - **原子性**：一个批次的所有操作在单个 SQLite 事务中按序执行，任一步 `InsufficientVolume` 或 `CapacityExceeded` 即回滚；失败批次以 `status="failed"` 落库（操作明细随回滚清空），方便审计。
 - **容量上限**：`wells.max_capacity` 以 TEXT 存 Decimal 字符串，`NULL` 表示不限——老库启动时经 `ALTER TABLE` 就地补列，既有数据一律为 `NULL`，行为完全保留。`PUT /wells/{well}/capacity` 设置（正数）或取消（`null`）上限；新上限低于当前体积返回 `409 capacity_below_volume` 且配置不变。补液与批次移液在**每一步**按目标孔当时体积校验上限：同一批次内「先移出再移入」因此可行，任一步超限整批回滚，409 载荷含超限孔位、当时体积、拟加入量与上限（批次场景失败批次同样落库并消耗 `request_key`）。撤销在恢复快照前核对各快照孔恢复后的体积，任一孔超过其**当前**上限即整次拒绝（`409 capacity_exceeded`，`exceeding_wells` 逐孔列出恢复后体积与上限），液体与审计记录不变；容量是孔位配置而非快照内容，恢复快照不改变上限。
-- **并发串行（`BEGIN IMMEDIATE`）**：补液、批次提交、撤销、容量变更、隔离申请与解除六个变更端点从事务起点（任何校验读之前）即取 SQLite 保留写锁，使「校验 → 写入 → 提交」全程互斥：后到的变更在取锁处等待，先到者提交后才读库，因此必然看到已提交的最新状态（先提交者决定后续校验看到的状态）。这消除了撤销的丢失更新——撤销完成阻塞检查后、恢复快照前若有补液先提交，撤销在锁内重检到该补液事件并返回 `409 blocked`（列出阻塞孔位与补液操作），不会以旧快照覆盖；反之撤销先提交时，补液在锁上等待，随后叠加在恢复后的状态上（含撤销中被删除、随后补液重建的孔）。两种顺序均不丢失组分。容量变更同理：补液先提交则容量校验看到补液后的体积，容量先提交则补液/批次/撤销看到新上限。隔离亦同理：隔离先提交则批次/补液在锁后读到隔离状态并返回 `409 well_quarantined`，批次先提交则隔离在锁后正常建立。
+- **并发串行（`BEGIN IMMEDIATE`）**：补液、批次提交、撤销、容量变更、隔离申请与解除、预留建立与取消八个变更端点从事务起点（任何校验读之前）即取 SQLite 保留写锁，使「校验 → 写入 → 提交」全程互斥：后到的变更在取锁处等待，先到者提交后才读库，因此必然看到已提交的最新状态（先提交者决定后续校验看到的状态）。这消除了撤销的丢失更新——撤销完成阻塞检查后、恢复快照前若有补液先提交，撤销在锁内重检到该补液事件并返回 `409 blocked`（列出阻塞孔位与补液操作），不会以旧快照覆盖；反之撤销先提交时，补液在锁上等待，随后叠加在恢复后的状态上（含撤销中被删除、随后补液重建的孔）。两种顺序均不丢失组分。容量变更同理：补液先提交则容量校验看到补液后的体积，容量先提交则补液/批次/撤销看到新上限。隔离亦同理：隔离先提交则批次/补液在锁后读到隔离状态并返回 `409 well_quarantined`，批次先提交则隔离在锁后正常建立。预留的建立、取消、绑定兑现与隔离/批次互相之间同样靠这把锁串行：预留先提交则未绑定批次在锁后读到占用（`409`，`available` 已扣除预留），批次先提交则预留在锁后读到减少后的体积；隔离申请在锁后看到生效预留即 `409 active_reservations`，预留先取消/先兑现则隔离正常建立。
 - **幂等**：`batches.request_key` 有唯一约束。重复提交返回首个批次记录（`replayed=true`，HTTP 200）；并发下同键请求先在锁内复核、再由唯一约束兜底，不会执行两次。
 - **批次撤销**：每个成功提交的批次在**同一事务**内对其首次触及的每个孔（来源与目标去重）保存批前快照——孔体积与各初始样本量，孔不存在则记 `NULL`。撤销时（`POST /batches/{id}/reversals`，请求体携带独立的 `request_key`）：
   - 仅当批次 `committed`、尚未撤销、存在快照，该批之后没有补液或已提交批次触及任一快照孔，且快照恢复后的各孔体积不超过其当前容量上限时才允许；条件不符返回 `409`，`reason` 取 `not_committed` / `already_reversed` / `no_snapshot` / `blocked` / `capacity_exceeded` / `request_key_conflict`；`blocked` 时在 `blocking_wells` 中逐孔列出后续操作（`top_up` 含样本与体积，`batch` 含后续批次 id 与 request_key），`capacity_exceeded` 时在 `exceeding_wells` 中逐孔列出恢复后体积与当前上限，**液体状态保持不变**；
@@ -228,7 +320,8 @@ curl -s http://localhost:8000/quarantines/releases  # 解除审计记录
   - 上线前已提交、没有快照的批次明确返回 `409 no_snapshot`，不可撤销。
   - 「后续操作」的判定基于孔位事件表 `well_events`（补液与批次提交各记一条，自增 id 即发生顺序）：以**本批次在该孔上的事件 id** 为基准，只统计之后的事件。
 - **孔位隔离**：`quarantine_requests`（申请，`request_key` 唯一）+ `quarantine_wells`（每孔一行，`released_at IS NULL` 上的部分唯一索引保证同一孔同一时刻只有一条生效隔离）+ `quarantine_releases` / `quarantine_release_wells`（解除审计，记录每个孔解除的是哪次申请）。申请在同一事务内先确认所有孔已登记且尚未隔离再原子写入：任一孔未登记（`404`）或已隔离（`409 already_quarantined`，`conflicting_wells` 逐孔列出当前案件）即整体回滚，不留部分状态、不消耗 `request_key`。隔离中的孔：补液、批次（来源或目标）、容量变更、撤销触及它的批次一律 `409 well_quarantined`（逐孔列出案件号），**液体、批次与审计均不变**——批次冲突不落失败批次、不消耗 `request_key`，解除隔离后同键可重试。解除须携带对应 `case_id`：任一孔未隔离（`not_quarantined`）或隔离案件不符（`case_mismatch`，附当前案件号）即 `409 release_mismatch` 整体拒绝；成功后申请记录保留（孔位行标记 `released_at`），解除记录单独追加，孔位查询（`GET /wells/{well}` 与 `GET /wells/{well}/batches`）返回当前隔离信息。两类 `request_key` 各自独立幂等：同键同目标（案件 + 排序去重后的孔位集合）重放返回首次结果（`replayed=true`），同键换目标返回 `409 request_key_conflict`；重放判定先于当前状态校验，因此解除后重新隔离的孔上重放旧解除键仍按重放处理。
-- **状态码**：登记/批次成功/撤销成功/隔离申请/解除隔离 `201`；容量设置/取消成功 `200`；幂等重放 `200`；体积不足、容量超限、撤销冲突、隔离冲突 `409`；孔位/批次不存在 `404`；参数非法 `422`。
+- **移液体积预留**：`reservations`（`request_key` 唯一，状态 `reserved` / `consumed` / `cancelled`）+ `reservation_wells`（每孔一行预留体积）+ `reservation_cancellations`（取消审计，`request_key` 与预留自身的键相互独立，`reservation_id` 唯一保证一条预留最多被取消一次）；`batches.reservation_id` 记录绑定关系（老库经 `ALTER TABLE` 就地补列，既有批次一律为 `NULL`，行为完全保留）。建立预留在同一事务内逐孔校验：孔须已登记、未隔离，且 `当前体积 − 其他生效预留总量 ≥ 预留量`；任一孔不符即回滚，不留部分预留、不消耗 `request_key`，409 载荷 `conflicting_wells` 逐孔给出 `available` / `reserved` / `requested`。预留量全部以 TEXT 存 Decimal 字符串、按 QUANTUM 量化，多预留可叠加占用同一孔。批次移液的来源孔可用量 = `当前体积 − 生效预留总量`（绑定批次扣除时排除自己绑定的那条），因此普通补液不会释放预留、未绑定批次无法动用被预留体积；绑定批次在写入批次记录**之前**完成逐孔逐量比对（各来源孔吸取总量按孔求和后必须与预留明细完全相等，差集任一侧出现即以 `reserved` / `requested` 列出，只出现在一侧的量记 0），不符抛 `reservation_mismatch` 整批拒绝——不落失败批次、不消耗批次 `request_key` 与预留；比对通过后所有移液与预留置 `consumed`（记 `batch_id` / `consumed_at`）在同一事务提交。取消仅对 `reserved` 预留生效：`consumed` 不可取消，`cancelled` 只能用原取消键重放；隔离申请逐孔检查生效预留，命中即 `409 active_reservations` 且 `blocking_wells` 列出阻塞预留编号、`request_key` 与体积（不留部分隔离、不消耗隔离键）。撤销在恢复快照前额外核对：恢复后任一孔体积低于其生效预留占用（含批次中新建、恢复即删除的孔，恢复量记 0）即 `409 reservation_undercut`（`undercut_wells` 列出恢复后体积与预留量），已消费预留不再占用、不阻塞撤销。预留 `request_key` 幂等目标是「逐孔 (well, volume) 有序明细」，取消 `request_key` 幂等目标是具体的预留编号。孔位查询返回 `reserved_volume`（该孔被生效预留占用的总量）。
+- **状态码**：登记/批次成功/撤销成功/隔离申请/解除隔离/预留建立/预留取消 `201`；容量设置/取消成功 `200`；幂等重放 `200`；体积不足、容量超限、撤销冲突、隔离冲突、预留不足/不兑现/取消已消费预留 `409`；孔位/批次/预留不存在 `404`；参数非法 `422`。
 
 ## 项目结构
 

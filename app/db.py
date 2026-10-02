@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS batches (
     request_key TEXT NOT NULL UNIQUE,
     status      TEXT NOT NULL CHECK (status IN ('committed', 'failed')),
     error       TEXT,
+    -- 提交时携带预留编号即绑定该预留；逐孔逐量兑现后同事务标记已消费。
+    reservation_id INTEGER REFERENCES reservations(id),
     created_at  TEXT NOT NULL
 );
 
@@ -129,6 +131,38 @@ CREATE TABLE IF NOT EXISTS quarantine_release_wells (
     request_id INTEGER NOT NULL REFERENCES quarantine_requests(id),
     PRIMARY KEY (release_id, well)
 );
+
+-- 移液体积预留：操作员用 request_key 为未来批次一次预留多个来源孔的体积；
+-- status=reserved 时各孔体积被「占用」，普通补液的容量余量与未绑定预留的
+-- 批次都不能动用；绑定预留编号的批次逐孔逐量完全兑现后在同一事务标记
+-- consumed；未消费预留可凭独立 request_key 整体取消（cancelled）。
+CREATE TABLE IF NOT EXISTS reservations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key TEXT NOT NULL UNIQUE,
+    status      TEXT NOT NULL CHECK (status IN ('reserved', 'consumed', 'cancelled')),
+    -- 兑现预留的批次（consumed 时写入）。
+    batch_id    INTEGER REFERENCES batches(id),
+    created_at  TEXT NOT NULL,
+    consumed_at TEXT
+);
+
+-- 每个预留逐孔一行预留体积（TEXT 存 Decimal 字符串）。
+CREATE TABLE IF NOT EXISTS reservation_wells (
+    reservation_id INTEGER NOT NULL REFERENCES reservations(id),
+    well           TEXT NOT NULL,
+    volume         TEXT NOT NULL,
+    PRIMARY KEY (reservation_id, well)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservation_wells_well ON reservation_wells(well);
+
+-- 预留取消审计：与预留自身的 request_key 独立，整次取消只追加一条。
+CREATE TABLE IF NOT EXISTS reservation_cancellations (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id INTEGER NOT NULL UNIQUE REFERENCES reservations(id),
+    request_key    TEXT NOT NULL UNIQUE,
+    cancelled_at   TEXT NOT NULL
+);
 """
 
 
@@ -158,13 +192,16 @@ def init_db() -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """老库就地升级：wells 表补 max_capacity 列。
+    """老库就地升级：wells 表补 max_capacity 列，batches 表补 reservation_id 列。
 
-    既有行的 max_capacity 为 NULL（不限容量），现有数据与行为完全保留。
+    既有行的新列一律为 NULL（不限容量 / 未绑定预留），现有数据与行为完全保留。
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(wells)")}
     if "max_capacity" not in columns:
         conn.execute("ALTER TABLE wells ADD COLUMN max_capacity TEXT")
+    batch_columns = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
+    if "reservation_id" not in batch_columns:
+        conn.execute("ALTER TABLE batches ADD COLUMN reservation_id INTEGER")
 
 
 @contextmanager

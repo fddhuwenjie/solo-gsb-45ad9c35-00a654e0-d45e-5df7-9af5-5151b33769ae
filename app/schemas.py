@@ -58,10 +58,16 @@ class TransferOp(BaseModel):
 
 
 class BatchCreate(BaseModel):
-    """一批移液操作，按 operations 顺序原子执行；request_key 用于幂等去重。"""
+    """一批移液操作，按 operations 顺序原子执行；request_key 用于幂等去重。
+
+    携带 reservation_id 时该批次绑定预留：必须逐孔逐量完全兑现该预留，
+    兑现成功在同一事务标记预留已消费；不携带时为普通批次，不能动用各孔
+    已生效（reserved）预留占用的体积。
+    """
 
     request_key: str = Field(min_length=1, max_length=128)
     operations: list[TransferOp] = Field(min_length=1)
+    reservation_id: int | None = Field(default=None, gt=0)
 
     @field_validator("request_key")
     @classmethod
@@ -136,4 +142,54 @@ class QuarantineReleaseCreate(_QuarantineWellsMixin):
         value = value.strip()
         if not value:
             raise ValueError("字段不能为空")
+        return value
+
+
+class ReservationVolume(BaseModel):
+    """预留中的单个来源孔及其 Decimal 预留体积（必须大于 0）。"""
+
+    well: str
+    volume: Decimal = Field(gt=0)
+
+    @field_validator("well")
+    @classmethod
+    def _well(cls, value: str) -> str:
+        return normalize_well(value)
+
+
+class ReservationCreate(BaseModel):
+    """为未来批次一次预留多个已登记来源孔的体积；request_key 用于幂等去重。"""
+
+    request_key: str = Field(min_length=1, max_length=128)
+    wells: list[ReservationVolume] = Field(min_length=1)
+
+    @field_validator("request_key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("request_key 不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def _dedupe_wells(self):
+        seen: set[str] = set()
+        for item in self.wells:
+            if item.well in seen:
+                raise ValueError(f"预留中孔位 {item.well} 重复，同一孔只能出现一次")
+            seen.add(item.well)
+        return self
+
+
+class ReservationCancelCreate(BaseModel):
+    """用独立 request_key 整体取消一个尚未消费的预留。"""
+
+    request_key: str = Field(min_length=1, max_length=128)
+
+    @field_validator("request_key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("request_key 不能为空")
         return value

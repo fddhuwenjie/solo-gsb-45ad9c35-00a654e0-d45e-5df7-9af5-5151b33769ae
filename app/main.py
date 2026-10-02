@@ -15,6 +15,8 @@ from .schemas import (
     CapacityUpdate,
     QuarantineCreate,
     QuarantineReleaseCreate,
+    ReservationCancelCreate,
+    ReservationCreate,
     ReversalCreate,
     WellCreate,
 )
@@ -160,6 +162,8 @@ def submit_batch(
     """提交一批移液操作：单事务按序执行，任一步体积不足或目标孔容量超限则整批回滚。
 
     request_key 幂等：相同键重复提交不会重复执行，直接返回首个结果。
+    携带 reservation_id 时绑定预留：必须逐孔逐量完全兑现，成功在同一事务
+    标记预留已消费；不兑现整批拒绝，不消耗预留。
     """
     existing = ledger.find_batch_by_key(conn, payload.request_key)
     if existing is not None:
@@ -168,9 +172,45 @@ def submit_batch(
 
     try:
         # 立即取写事务：幂等检查、体积校验与全部写入持锁完成，与并发
-        # 补液/撤销/批次从校验开始串行
+        # 补液/撤销/批次/预留从校验开始串行
         with db_module.write_transaction(conn):
-            batch_id = ledger.execute_batch(conn, payload.request_key, payload.operations)
+            batch_id = ledger.execute_batch(
+                conn,
+                payload.request_key,
+                payload.operations,
+                reservation_id=payload.reservation_id,
+            )
+    except ledger.ReservationNotFound as exc:
+        # 预留不存在：不落失败批次、不消耗 request_key
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_not_found",
+                "reservation_id": exc.reservation_id,
+            },
+        )
+    except ledger.ReservationNotActive as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_not_active",
+                "reservation_id": exc.reservation_id,
+                "status": exc.status,
+            },
+        )
+    except ledger.ReservationMismatch as exc:
+        # 未逐孔逐量兑现：整批拒绝，不落失败批次、不消耗预留与 request_key
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_mismatch",
+                "reservation_id": exc.reservation_id,
+                "wells": exc.wells,
+            },
+        )
     except ledger.WellQuarantined as exc:
         # 隔离冲突：液体、批次与审计均不变——不落失败批次、不消耗 request_key，
         # 解除隔离后同键可重试
@@ -179,7 +219,13 @@ def submit_batch(
         # 状态已回滚；把失败批次也记录下来，消耗掉这个 request_key
         try:
             with db_module.write_transaction(conn):
-                batch_id = ledger.insert_batch(conn, payload.request_key, "failed", error=str(exc))
+                batch_id = ledger.insert_batch(
+                    conn,
+                    payload.request_key,
+                    "failed",
+                    error=str(exc),
+                    reservation_id=payload.reservation_id,
+                )
         except sqlite3.IntegrityError:
             row = ledger.find_batch_by_key(conn, payload.request_key)
             response.status_code = 200
@@ -198,7 +244,13 @@ def submit_batch(
         # 与体积不足同理：状态已回滚；失败批次落库并消耗 request_key
         try:
             with db_module.write_transaction(conn):
-                batch_id = ledger.insert_batch(conn, payload.request_key, "failed", error=str(exc))
+                batch_id = ledger.insert_batch(
+                    conn,
+                    payload.request_key,
+                    "failed",
+                    error=str(exc),
+                    reservation_id=payload.reservation_id,
+                )
         except sqlite3.IntegrityError:
             row = ledger.find_batch_by_key(conn, payload.request_key)
             response.status_code = 200
@@ -305,6 +357,8 @@ def reverse_batch(
             detail["blocking_wells"] = exc.blockers
         if exc.exceeding:
             detail["exceeding_wells"] = exc.exceeding
+        if exc.undercut:
+            detail["undercut_wells"] = exc.undercut
         raise HTTPException(status_code=409, detail=detail)
     except sqlite3.IntegrityError:
         # 兜底：极端并发下 request_key 唯一约束拦截（正常已被锁内复核覆盖）
@@ -447,6 +501,15 @@ def create_quarantine(
                 "conflicting_wells": exc.conflicts,
             },
         )
+    except ledger.ActiveReservationsConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "active_reservations",
+                "blocking_wells": exc.blockers,
+            },
+        )
     except sqlite3.IntegrityError:
         # 兜底：极端并发下 request_key 唯一约束拦截（正常已被锁内复核覆盖）
         row = ledger.find_quarantine_by_key(conn, payload.request_key)
@@ -520,3 +583,223 @@ def list_quarantine_releases(conn: sqlite3.Connection = Depends(get_db)) -> dict
     """全部解除隔离审计记录。"""
     rows = conn.execute("SELECT id FROM quarantine_releases ORDER BY id").fetchall()
     return {"releases": [ledger.release_payload(conn, row["id"]) for row in rows]}
+
+
+# ---------------------------------------------------------------- 移液体积预留
+
+
+def _reservation_target(conn: sqlite3.Connection, reservation_id: int) -> list[tuple[str, str]]:
+    """预留目标：排序后的 (孔, 体积字符串) 列表（同键换目标判定的依据）。"""
+    return [
+        (line["well"], line["volume"])
+        for line in conn.execute(
+            "SELECT well, volume FROM reservation_wells WHERE reservation_id = ? ORDER BY well",
+            (reservation_id,),
+        ).fetchall()
+    ]
+
+
+def _reservation_replay_or_conflict(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    payload: ReservationCreate,
+    response: Response,
+) -> dict:
+    """同键同目标（逐孔逐量）按重放返回首次结果；同键换目标返回 409。"""
+    existing_target = _reservation_target(conn, int(row["id"]))
+    new_target = [(item.well, ledger.dec_str(ledger.q(item.volume))) for item in payload.wells]
+    if existing_target == new_target:
+        response.status_code = 200
+        return ledger.reservation_payload(conn, int(row["id"]), replayed=True)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": (
+                f"request_key {payload.request_key} 已用于预留 "
+                f"{'、'.join(f'{w}:{v}' for w, v in existing_target)}，"
+                f"不能再用于预留 {'、'.join(f'{w}:{v}' for w, v in new_target)}"
+            ),
+            "reason": "request_key_conflict",
+            "reservation_id": int(row["id"]),
+            "existing_wells": [
+                {"well": well, "volume": volume} for well, volume in existing_target
+            ],
+        },
+    )
+
+
+@app.post("/reservations", status_code=201)
+def create_reservation(
+    payload: ReservationCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """为未来批次一次预留多个已登记来源孔的 Decimal 体积。
+
+    服务在同一事务内逐孔检查：孔必须已登记、未隔离，且当前体积扣除其他
+    生效预留后仍不少于预留量；同一孔在请求内重复（422）或任一孔不足/隔离
+    即整次失败、不留部分预留、不消耗 request_key。
+    request_key 幂等：同键同目标（逐孔逐量）重放返回首次结果（200），
+    同键换目标返回 409。
+    """
+    # 事务外快速路径：无并发时直接给出重放/换目标结论，免取写锁。
+    existing = ledger.find_reservation_by_key(conn, payload.request_key)
+    if existing is not None:
+        return _reservation_replay_or_conflict(conn, existing, payload, response)
+
+    wells = [(item.well, ledger.q(item.volume)) for item in payload.wells]
+    try:
+        # BEGIN IMMEDIATE 立即取锁：幂等复核、可用量/隔离校验与写入持同一把
+        # 锁完成，与并发补液/批次/取消/兑现/隔离申请串行。
+        with db_module.write_transaction(conn):
+            row = ledger.find_reservation_by_key(conn, payload.request_key)
+            if row is not None:
+                return _reservation_replay_or_conflict(conn, row, payload, response)
+            reservation_id = ledger.apply_reservation(conn, payload.request_key, wells)
+    except ledger.WellNotFound as exc:
+        raise HTTPException(
+            status_code=404, detail=f"孔位 {exc.well} 尚未登记，不能预留"
+        )
+    except ledger.WellQuarantined as exc:
+        # 隔离孔禁止预留：不留部分预留、不消耗 request_key
+        raise HTTPException(status_code=409, detail=_well_quarantined_detail(exc))
+    except ledger.ReservationInsufficient as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_insufficient",
+                "conflicting_wells": exc.conflicts,
+            },
+        )
+    except sqlite3.IntegrityError:
+        # 兜底：极端并发下 request_key 唯一约束拦截（正常已被锁内复核覆盖）
+        row = ledger.find_reservation_by_key(conn, payload.request_key)
+        if row is not None:
+            return _reservation_replay_or_conflict(conn, row, payload, response)
+        raise HTTPException(status_code=409, detail="预留写入冲突")
+
+    response.status_code = 201
+    return ledger.reservation_payload(conn, reservation_id)
+
+
+@app.get("/reservations")
+def list_reservations(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """全部预留记录（含生效、已消费、已取消及逐孔预留明细）。"""
+    rows = conn.execute("SELECT id FROM reservations ORDER BY id").fetchall()
+    return {"reservations": [ledger.reservation_payload(conn, row["id"]) for row in rows]}
+
+
+@app.get("/reservations/{reservation_id}")
+def get_reservation(reservation_id: int, conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """单个预留的逐孔明细与状态。"""
+    payload = ledger.reservation_payload(conn, reservation_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"预留 {reservation_id} 不存在")
+    return payload
+
+
+@app.post("/reservations/{reservation_id}/cancellations", status_code=201)
+def cancel_reservation(
+    reservation_id: int,
+    payload: ReservationCancelCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """用独立 request_key 整体取消一个尚未消费的预留。
+
+    已消费预留不可取消（409 reservation_not_active）；已取消预留可用同一
+    request_key 重放首次结果（200），同键用于取消其他预留返回 409。
+    取消与隔离申请、批次兑现经同一把写锁串行。
+    """
+    # 事务外快速路径：同一取消键重放（无论目标预留当前是什么状态）。
+    existing = ledger.find_cancellation_by_key(conn, payload.request_key)
+    if existing is not None:
+        if int(existing["reservation_id"]) != reservation_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        f"request_key {payload.request_key} 已用于取消预留 "
+                        f"{existing['reservation_id']}，不能再用于预留 {reservation_id}"
+                    ),
+                    "reason": "request_key_conflict",
+                    "reservation_id": reservation_id,
+                    "existing_reservation_id": int(existing["reservation_id"]),
+                },
+            )
+        response.status_code = 200
+        return ledger.cancellation_payload(conn, int(existing["id"]), replayed=True)
+
+    try:
+        with db_module.write_transaction(conn):
+            row = ledger.find_cancellation_by_key(conn, payload.request_key)
+            if row is not None:
+                if int(row["reservation_id"]) != reservation_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": (
+                                f"request_key {payload.request_key} 已用于取消预留 "
+                                f"{row['reservation_id']}，不能再用于预留 {reservation_id}"
+                            ),
+                            "reason": "request_key_conflict",
+                            "reservation_id": reservation_id,
+                            "existing_reservation_id": int(row["reservation_id"]),
+                        },
+                    )
+                response.status_code = 200
+                return ledger.cancellation_payload(conn, int(row["id"]), replayed=True)
+            cancellation_id = ledger.apply_cancellation(
+                conn, reservation_id, payload.request_key
+            )
+    except ledger.ReservationNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_not_found",
+                "reservation_id": exc.reservation_id,
+            },
+        )
+    except ledger.ReservationNotActive as exc:
+        # 已消费不可取消；已取消但用了新 request_key：明确告知不可再次取消
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_not_active",
+                "reservation_id": exc.reservation_id,
+                "status": exc.status,
+            },
+        )
+    except sqlite3.IntegrityError:
+        # 并发下同一取消键已被写入，或预留已被并发取消/消费
+        row = ledger.find_cancellation_by_key(conn, payload.request_key)
+        if row is not None:
+            if int(row["reservation_id"]) != reservation_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "取消 request_key 已用于其他预留",
+                        "reason": "request_key_conflict",
+                    },
+                )
+            response.status_code = 200
+            return ledger.cancellation_payload(conn, int(row["id"]), replayed=True)
+        current = conn.execute(
+            "SELECT status FROM reservations WHERE id = ?", (reservation_id,)
+        ).fetchone()
+        status = None if current is None else current["status"]
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"预留 {reservation_id} 不再是生效预留（{status}）",
+                "reason": "reservation_not_active",
+                "reservation_id": reservation_id,
+                "status": status,
+            },
+        )
+
+    response.status_code = 201
+    return ledger.cancellation_payload(conn, cancellation_id)

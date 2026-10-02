@@ -418,10 +418,10 @@ def test_batch_committed_first_quarantine_still_applies(client, monkeypatch):
     gate = _Gate()
     original = ledger.execute_batch
 
-    def gated_batch(conn, request_key, operations):
+    def gated_batch(conn, request_key, operations, reservation_id=None):
         gate.entered.set()
         assert gate.release.wait(10.0), "批次线程未被释放"
-        return original(conn, request_key, operations)
+        return original(conn, request_key, operations, reservation_id=reservation_id)
 
     monkeypatch.setattr(ledger, "execute_batch", gated_batch)
 
