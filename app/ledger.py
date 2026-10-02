@@ -57,7 +57,8 @@ class CapacityConflict(Exception):
 
 
 class WellQuarantined(Exception):
-    """孔位处于隔离状态：禁止补液、作为批次来源/目标、修改容量或撤销触及它的批次。
+    """孔位处于隔离状态：禁止补液、作为批次来源/目标、修改容量、预留体积
+    或撤销触及它的批次。
 
     wells 为 _active_quarantine_map 命中的行（含 case_id），冲突时液体、
     批次与审计记录均不变。
@@ -216,16 +217,27 @@ def _allocate_move(
     return allocated
 
 
-def apply_transfer(conn: sqlite3.Connection, source: str, destination: str, volume: Decimal) -> None:
+def apply_transfer(
+    conn: sqlite3.Connection,
+    source: str,
+    destination: str,
+    volume: Decimal,
+    reserved_by_others: Decimal = ZERO,
+) -> None:
     """执行一次移液：按来源组成占比，以最小计量单位（QUANTUM）整数取走各样本。
 
     用最大余量法分配整数单位，保证实际带走的组分量之和恰好等于请求体积，
     从而来源孔和目标孔在每一步都满足「组分量之和 = 体积」。
+
+    reserved_by_others 是该来源孔上本批次无权动用的体积（未绑定批次时为
+    全部生效预留量之和；绑定预留时为「其他」生效预留量之和）。可吸取量
+    因此为 src_volume - reserved_by_others，低于吸取量即 InsufficientVolume。
     """
     volume = q(volume)
     src_volume = get_well_volume(conn, source) or ZERO
-    if src_volume < volume:
-        raise InsufficientVolume(source, src_volume, volume)
+    usable = src_volume - reserved_by_others
+    if usable < volume:
+        raise InsufficientVolume(source, usable, volume)
 
     ensure_well(conn, destination)
     rows = conn.execute(
@@ -282,6 +294,10 @@ def well_state(conn: sqlite3.Connection, well: str) -> dict | None:
         composition.append(
             {"sample": row2["sample"], "amount": dec_str(amount), "fraction": dec_str(fraction)}
         )
+    reserved_total = active_reserved_total(conn, well)
+    available = volume - reserved_total
+    if available < ZERO:
+        available = ZERO
     return {
         "well": well,
         "volume": dec_str(volume),
@@ -289,6 +305,11 @@ def well_state(conn: sqlite3.Connection, well: str) -> dict | None:
             None if row["max_capacity"] is None else dec_str(Decimal(row["max_capacity"]))
         ),
         "quarantine": well_quarantine(conn, well),
+        # 生效预留（active）占用的总体积；普通补液与未绑定批次不可动用
+        "reserved_volume": dec_str(reserved_total),
+        # 普通补液/未绑定批次实际可动用的体积 = 当前体积 - 生效预留量
+        "available_volume": dec_str(available),
+        "reservations": active_reservation_items(conn, well),
         "composition": composition,
     }
 
@@ -299,10 +320,17 @@ def find_batch_by_key(conn: sqlite3.Connection, request_key: str) -> sqlite3.Row
     return conn.execute("SELECT * FROM batches WHERE request_key = ?", (request_key,)).fetchone()
 
 
-def insert_batch(conn: sqlite3.Connection, request_key: str, status: str, error: str | None = None) -> int:
+def insert_batch(
+    conn: sqlite3.Connection,
+    request_key: str,
+    status: str,
+    error: str | None = None,
+    reservation_id: int | None = None,
+) -> int:
     cur = conn.execute(
-        "INSERT INTO batches (request_key, status, error, created_at) VALUES (?, ?, ?, ?)",
-        (request_key, status, error, _now()),
+        "INSERT INTO batches (request_key, status, error, reservation_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (request_key, status, error, reservation_id, _now()),
     )
     return int(cur.lastrowid)
 
@@ -327,11 +355,23 @@ def _save_pre_batch_snapshot(conn: sqlite3.Connection, batch_id: int, wells: lis
         )
 
 
-def execute_batch(conn: sqlite3.Connection, request_key: str, operations: list) -> int:
+def execute_batch(
+    conn: sqlite3.Connection,
+    request_key: str,
+    operations: list,
+    reservation_id: int | None = None,
+) -> int:
     """在调用方的事务内按提交顺序执行；任一步抛异常由调用方回滚整批。
 
     任一触及孔处于隔离状态即抛 WellQuarantined——在写入任何批次记录之前，
     因此隔离冲突不落失败批次、不消耗 request_key。
+
+    携带 reservation_id 时（绑定预留批次）：预留必须存在且为 active，且批次
+    从每个预留来源孔吸取的体积之和与预留体积严格相等（预留的每个孔也都必须
+    作为来源出现），否则抛 ReservationFulfillmentMismatch；此时本批次有权
+    动用该预留的体积，但仍不能动用同孔其他生效预留的体积。未绑定预留的普通
+    批次不能动用任何生效预留体积。只有逐孔逐量完全兑现并成功提交时，才在同
+    一事务把预留标记为 consumed；任何失败随事务回滚，预留不被消耗。
     """
     touched_wells = list(dict.fromkeys(
         well
@@ -341,12 +381,51 @@ def execute_batch(conn: sqlite3.Connection, request_key: str, operations: list) 
     quarantined = _active_quarantine_map(conn, touched_wells)
     if quarantined:
         raise WellQuarantined([quarantined[w] for w in touched_wells if w in quarantined])
-    batch_id = insert_batch(conn, request_key, "committed")
+
+    own_items: dict[str, Decimal] = {}
+    if reservation_id is not None:
+        res = conn.execute(
+            "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+        ).fetchone()
+        if res is None:
+            raise ReservationNotFound(reservation_id)
+        if res["status"] != "active":
+            raise ReservationNotActive(reservation_id, res["status"])
+        own_items = {
+            r["well"]: Decimal(r["volume"])
+            for r in conn.execute(
+                "SELECT well, volume FROM reservation_items WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchall()
+        }
+        requested_by_well: dict[str, Decimal] = {}
+        for op in operations:
+            requested_by_well[op.source] = requested_by_well.get(op.source, ZERO) + q(
+                op.volume
+            )
+        mismatches = _fulfillment_mismatches(own_items, requested_by_well)
+        if mismatches:
+            raise ReservationFulfillmentMismatch(reservation_id, mismatches)
+
+    # 各来源孔上本批次无权动用的生效预留量：绑定预留时扣除本预留自身占用的
+    # 部分（它正是为这个批次预留的）；未绑定时全部生效预留均不可动用。
+    source_wells = list(dict.fromkeys(op.source for op in operations))
+    active_map = active_reserved_map(conn, source_wells)
+    held_by_others: dict[str, Decimal] = {}
+    for well in source_wells:
+        held = active_map.get(well, ZERO) - own_items.get(well, ZERO)
+        held_by_others[well] = held if held > ZERO else ZERO
+
+    batch_id = insert_batch(
+        conn, request_key, "committed", reservation_id=reservation_id
+    )
     # 先于任何移液保存批前快照，保证与最终提交同事务、可整体回滚。
     _save_pre_batch_snapshot(conn, batch_id, touched_wells)
     for step, op in enumerate(operations, start=1):
         volume = q(op.volume)
-        apply_transfer(conn, op.source, op.destination, volume)
+        apply_transfer(
+            conn, op.source, op.destination, volume, held_by_others[op.source]
+        )
         conn.execute(
             "INSERT INTO operations (batch_id, step, source, destination, volume) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -354,7 +433,29 @@ def execute_batch(conn: sqlite3.Connection, request_key: str, operations: list) 
         )
     for well in touched_wells:
         _record_event(conn, well, "batch", batch_id=batch_id)
+    if reservation_id is not None:
+        # 与批次同一事务：兑现与标记 consumed 原子，失败不消耗预留。
+        mark_reservation_consumed(conn, reservation_id, batch_id)
     return batch_id
+
+
+def _fulfillment_mismatches(
+    reserved: dict[str, Decimal], requested: dict[str, Decimal]
+) -> list[dict]:
+    """逐孔对比预留体积与批次实际吸取量；完全兑现（孔集与体积均相等）返回 []。"""
+    mismatches: list[dict] = []
+    for well in sorted(set(reserved) | set(requested)):
+        reserved_volume = reserved.get(well)
+        requested_volume = requested.get(well)
+        if reserved_volume != requested_volume:
+            mismatches.append(
+                {
+                    "well": well,
+                    "reserved": None if reserved_volume is None else dec_str(reserved_volume),
+                    "requested": None if requested_volume is None else dec_str(requested_volume),
+                }
+            )
+    return mismatches
 
 
 def batch_payload(conn: sqlite3.Connection, batch_id: int, replayed: bool = False) -> dict:
@@ -373,6 +474,7 @@ def batch_payload(conn: sqlite3.Connection, batch_id: int, replayed: bool = Fals
         "request_key": row["request_key"],
         "status": row["status"],
         "error": row["error"],
+        "reservation_id": row["reservation_id"],
         "created_at": row["created_at"],
         "replayed": replayed,
         "reversed": reversal is not None,
@@ -554,6 +656,17 @@ def apply_reversal(conn: sqlite3.Connection, batch_id: int, request_key: str) ->
             exceeding=exceeding,
         )
 
+    # 恢复快照前同样要保证「体积不低于生效预留量」的不变量：恢复后被预留
+    # 的液体不得少于各孔 active 预留之和。快照为 NULL 的孔（恢复即删除）上
+    # 若仍有生效预留，同样阻塞撤销。
+    reservation_blockers = _reservation_restore_blockers(conn, snaps)
+    if reservation_blockers:
+        raise ReversalConflict(
+            "reservations_active",
+            f"批次 {batch_id} 撤销后部分孔位液体不足以覆盖生效预留，不可撤销",
+            blockers=reservation_blockers,
+        )
+
     _restore_snapshot(conn, batch_id)
     cur = conn.execute(
         "INSERT INTO reversals (batch_id, request_key, reversed_at) VALUES (?, ?, ?)",
@@ -645,6 +758,11 @@ def apply_quarantine(
     active = _active_quarantine_map(conn, wells)
     if active:
         raise QuarantineConflict([active[w] for w in wells if w in active])
+    # 隔离申请与预留建立/兑现/取消串行：孔上存在生效预留时拒绝隔离
+    # （被预留的液体已有归属，隔离会使兑现批次无法执行），逐孔列出阻塞预留。
+    blocked = active_reservation_blockers(conn, wells)
+    if blocked:
+        raise ReservationsBlockQuarantine(blocked)
     cur = conn.execute(
         "INSERT INTO quarantine_requests (request_key, case_id, reason, created_at) "
         "VALUES (?, ?, ?, ?)",
@@ -745,4 +863,363 @@ def release_payload(conn: sqlite3.Connection, release_id: int, replayed: bool = 
         "wells": [
             {"well": w["well"], "quarantine_id": w["request_id"]} for w in wells
         ],
+    }
+
+
+# ---------------------------------------------------------------- 移液体积预留
+
+
+class ReservationUnavailable(Exception):
+    """预留建立时部分孔可用体积不足（扣除其他生效预留后）：整次预留回滚。"""
+
+    def __init__(self, conflicts: list[dict]) -> None:
+        self.conflicts = conflicts
+        parts = [
+            f"{c['well']}（可用 {c['available']}，请求预留 {c['requested']}，"
+            f"已预留 {c['already_reserved']}）"
+            for c in conflicts
+        ]
+        super().__init__(f"孔位 {'、'.join(parts)} 可预留体积不足，整次预留拒绝")
+
+
+class ReservationNotFound(Exception):
+    """预留编号不存在。"""
+
+    def __init__(self, reservation_id: int) -> None:
+        self.reservation_id = reservation_id
+        super().__init__(f"预留 {reservation_id} 不存在")
+
+
+class ReservationNotActive(Exception):
+    """预留不是生效状态（已消费/已取消），不能再被批次兑现或取消。"""
+
+    def __init__(self, reservation_id: int, status: str) -> None:
+        self.reservation_id = reservation_id
+        self.status = status
+        super().__init__(f"预留 {reservation_id} 当前状态为 {status}，不是生效预留")
+
+
+class ReservationFulfillmentMismatch(Exception):
+    """绑定预留的批次未逐孔逐量完全兑现：整批失败，预留不被消耗。"""
+
+    def __init__(self, reservation_id: int, mismatches: list[dict]) -> None:
+        self.reservation_id = reservation_id
+        self.mismatches = mismatches
+        parts = [
+            f"{m['well']}（预留 {m['reserved']}，批次吸取 "
+            f"{m['requested'] if m['requested'] is not None else '0'}）"
+            for m in mismatches
+        ]
+        super().__init__(
+            f"批次未逐孔逐量兑现预留 {reservation_id}：{'、'.join(parts)}，整批拒绝"
+        )
+
+
+class ReservationCancelConflict(Exception):
+    """取消请求不合法：预留不存在/已消费/已取消。"""
+
+    def __init__(
+        self, reason: str, message: str, reservation_id: int, status: str | None = None
+    ) -> None:
+        self.reason = reason
+        self.message = message
+        self.reservation_id = reservation_id
+        self.status = status
+        super().__init__(message)
+
+
+class ReservationsBlockQuarantine(Exception):
+    """隔离申请被生效预留阻塞：逐孔列出阻塞预留，整次隔离拒绝。"""
+
+    def __init__(self, blockers: list[dict]) -> None:
+        self.blockers = blockers
+        labels = "、".join(b["well"] for b in blockers)
+        super().__init__(f"孔位 {labels} 上存在生效预留，整次隔离申请拒绝")
+
+
+def active_reserved_map(conn: sqlite3.Connection, wells: list[str]) -> dict[str, Decimal]:
+    """这些孔上当前 active 预留占用的体积之和（一孔可能被多个预留部分占用）。"""
+    if not wells:
+        return {}
+    placeholders = ", ".join("?" for _ in wells)
+    rows = conn.execute(
+        "SELECT ri.well AS well, ri.volume AS volume "
+        "FROM reservation_items ri "
+        "JOIN reservations r ON r.id = ri.reservation_id "
+        "WHERE r.status = 'active' AND ri.well IN (" + placeholders + ")",
+        list(wells),
+    ).fetchall()
+    totals: dict[str, Decimal] = {well: ZERO for well in wells}
+    for row in rows:
+        totals[row["well"]] += Decimal(row["volume"])
+    return totals
+
+
+def active_reserved_total(conn: sqlite3.Connection, well: str) -> Decimal:
+    """单孔当前 active 预留占用的体积之和。"""
+    return active_reserved_map(conn, [well]).get(well, ZERO)
+
+
+def active_reservation_items(conn: sqlite3.Connection, well: str) -> list[dict]:
+    """孔上各条生效预留的明细（预留编号、request_key 与本孔预留体积）。"""
+    rows = conn.execute(
+        "SELECT r.id AS reservation_id, r.request_key AS request_key, "
+        "       ri.volume AS volume, r.created_at AS reserved_at "
+        "FROM reservation_items ri "
+        "JOIN reservations r ON r.id = ri.reservation_id "
+        "WHERE ri.well = ? AND r.status = 'active' "
+        "ORDER BY r.id",
+        (well,),
+    ).fetchall()
+    return [
+        {
+            "reservation_id": row["reservation_id"],
+            "request_key": row["request_key"],
+            "volume": row["volume"],
+            "reserved_at": row["reserved_at"],
+        }
+        for row in rows
+    ]
+
+
+def active_reservation_blockers(conn: sqlite3.Connection, wells: list[str]) -> list[dict]:
+    """这些孔上存在生效预留的孔 -> 阻塞明细（隔离申请整次拒绝时逐孔列出）。"""
+    blockers: list[dict] = []
+    for well in wells:
+        items = active_reservation_items(conn, well)
+        if items:
+            blockers.append(
+                {
+                    "well": well,
+                    "reserved_volume": dec_str(
+                        sum((Decimal(i["volume"]) for i in items), ZERO)
+                    ),
+                    "reservations": [
+                        {
+                            "reservation_id": i["reservation_id"],
+                            "request_key": i["request_key"],
+                            "volume": i["volume"],
+                        }
+                        for i in items
+                    ],
+                }
+            )
+    return blockers
+
+
+def _reservation_restore_blockers(
+    conn: sqlite3.Connection, snaps: list[sqlite3.Row]
+) -> list[dict]:
+    """撤销恢复快照后体积将低于生效预留量（或孔将被删除但仍有生效预留）的孔。"""
+    blockers: list[dict] = []
+    for snap in snaps:
+        well = snap["well"]
+        reserved = active_reserved_total(conn, well)
+        if reserved == ZERO:
+            continue
+        restored = ZERO if snap["volume"] is None else Decimal(snap["volume"])
+        if restored < reserved:
+            blockers.append(
+                {
+                    "well": well,
+                    "restored_volume": dec_str(restored),
+                    "reserved_volume": dec_str(reserved),
+                    "reservations": [
+                        {
+                            "reservation_id": i["reservation_id"],
+                            "request_key": i["request_key"],
+                            "volume": i["volume"],
+                        }
+                        for i in active_reservation_items(conn, well)
+                    ],
+                }
+            )
+    return blockers
+
+
+def find_reservation_by_key(
+    conn: sqlite3.Connection, request_key: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM reservations WHERE request_key = ?", (request_key,)
+    ).fetchone()
+
+
+def find_cancellation_by_key(
+    conn: sqlite3.Connection, request_key: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM reservation_cancellations WHERE request_key = ?", (request_key,)
+    ).fetchone()
+
+
+def apply_reservation(
+    conn: sqlite3.Connection, request_key: str, items: list
+) -> int:
+    """在调用方事务内校验并原子建立预留。
+
+    任一孔未登记（WellNotFound）、处于隔离状态（WellQuarantined）或扣除其他
+    生效预留后可用体积不足（ReservationUnavailable）即抛出，由调用方回滚，
+    整次预留不留部分状态、不消耗 request_key。
+    """
+    wells = [item.well for item in items]
+    quarantined = _active_quarantine_map(conn, wells)
+    if quarantined:
+        raise WellQuarantined([quarantined[w] for w in wells if w in quarantined])
+    reserved_map = active_reserved_map(conn, wells)
+    conflicts: list[dict] = []
+    for item in items:
+        volume = get_well_volume(conn, item.well)
+        if volume is None:
+            raise WellNotFound(item.well)
+        requested = q(item.volume)
+        already_reserved = reserved_map[item.well]
+        available = volume - already_reserved
+        if available < requested:
+            conflicts.append(
+                {
+                    "well": item.well,
+                    "available": dec_str(available),
+                    "already_reserved": dec_str(already_reserved),
+                    "requested": dec_str(requested),
+                }
+            )
+    if conflicts:
+        raise ReservationUnavailable(conflicts)
+    cur = conn.execute(
+        "INSERT INTO reservations (request_key, status, created_at) VALUES (?, 'active', ?)",
+        (request_key, _now()),
+    )
+    reservation_id = int(cur.lastrowid)
+    conn.executemany(
+        "INSERT INTO reservation_items (reservation_id, well, volume) VALUES (?, ?, ?)",
+        [
+            (reservation_id, item.well, dec_str(q(item.volume)))
+            for item in items
+        ],
+    )
+    return reservation_id
+
+
+def mark_reservation_consumed(
+    conn: sqlite3.Connection, reservation_id: int, batch_id: int
+) -> None:
+    """在批次同一事务内把预留标记为 consumed（调用方已完成 active 与兑现校验）。"""
+    conn.execute(
+        "UPDATE reservations SET status = 'consumed', consumed_at = ?, "
+        "consumed_batch_id = ? WHERE id = ?",
+        (_now(), batch_id, reservation_id),
+    )
+
+
+def apply_cancellation(
+    conn: sqlite3.Connection, reservation_id: int, request_key: str
+) -> int:
+    """在调用方事务内整体取消一个 active 预留。
+
+    预留不存在抛 ReservationNotFound；已消费/已取消抛 ReservationCancelConflict
+    （由调用方随事务回滚，request_key 不消耗）。
+    """
+    row = conn.execute(
+        "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+    ).fetchone()
+    if row is None:
+        raise ReservationNotFound(reservation_id)
+    if row["status"] == "consumed":
+        raise ReservationCancelConflict(
+            "already_consumed",
+            f"预留 {reservation_id} 已被批次 {row['consumed_batch_id']} 消费，不能取消",
+            reservation_id,
+            "consumed",
+        )
+    if row["status"] == "cancelled":
+        existing = conn.execute(
+            "SELECT id FROM reservation_cancellations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        raise ReservationCancelConflict(
+            "already_cancelled",
+            f"预留 {reservation_id} 已经取消，不能重复取消",
+            reservation_id,
+            "cancelled",
+        )
+    now = _now()
+    cur = conn.execute(
+        "INSERT INTO reservation_cancellations (reservation_id, request_key, cancelled_at) "
+        "VALUES (?, ?, ?)",
+        (reservation_id, request_key, now),
+    )
+    cancellation_id = int(cur.lastrowid)
+    conn.execute(
+        "UPDATE reservations SET status = 'cancelled', cancelled_at = ?, "
+        "cancellation_id = ? WHERE id = ?",
+        (now, cancellation_id, reservation_id),
+    )
+    return cancellation_id
+
+
+def reservation_target(
+    conn: sqlite3.Connection, reservation_id: int
+) -> list[tuple[str, str]]:
+    """预留目标：排序后的 (well, volume) 列表，同键换目标判定的依据。"""
+    rows = conn.execute(
+        "SELECT well, volume FROM reservation_items WHERE reservation_id = ? ORDER BY well",
+        (reservation_id,),
+    ).fetchall()
+    return [(row["well"], row["volume"]) for row in rows]
+
+
+def reservation_payload(
+    conn: sqlite3.Connection, reservation_id: int, replayed: bool = False
+) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    items = conn.execute(
+        "SELECT well, volume FROM reservation_items WHERE reservation_id = ? ORDER BY well",
+        (reservation_id,),
+    ).fetchall()
+    cancellation = None
+    if row["cancellation_id"] is not None:
+        crow = conn.execute(
+            "SELECT id, request_key, cancelled_at FROM reservation_cancellations WHERE id = ?",
+            (row["cancellation_id"],),
+        ).fetchone()
+        if crow is not None:
+            cancellation = {
+                "cancellation_id": crow["id"],
+                "request_key": crow["request_key"],
+                "cancelled_at": crow["cancelled_at"],
+            }
+    return {
+        "reservation_id": row["id"],
+        "request_key": row["request_key"],
+        "status": row["status"],
+        "replayed": replayed,
+        "created_at": row["created_at"],
+        "consumed_at": row["consumed_at"],
+        "consumed_batch_id": row["consumed_batch_id"],
+        "cancelled_at": row["cancelled_at"],
+        "cancellation": cancellation,
+        "items": [{"well": item["well"], "volume": item["volume"]} for item in items],
+    }
+
+
+def cancellation_payload(
+    conn: sqlite3.Connection, cancellation_id: int, replayed: bool = False
+) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM reservation_cancellations WHERE id = ?", (cancellation_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "cancellation_id": row["id"],
+        "reservation_id": row["reservation_id"],
+        "request_key": row["request_key"],
+        "cancelled_at": row["cancelled_at"],
+        "replayed": replayed,
+        "reservation": reservation_payload(conn, row["reservation_id"]),
     }
